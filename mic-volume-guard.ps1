@@ -46,32 +46,37 @@ interface IAudioEndpointVolume {
 }
 
 public static class AudioHelper {
-    public static float[] GetCaptureVolumes() {
+    // Returns parallel arrays: volumes[i] = scalar 0-1, muted[i] = mute flag
+    public static void GetCaptureState(out float[] volumes, out bool[] muted) {
+        volumes = new float[0];
+        muted = new bool[0];
         try {
             var enumeratorType = Type.GetTypeFromCLSID(new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E"));
             var enumerator = (IMMDeviceEnumerator)Activator.CreateInstance(enumeratorType);
             IMMDeviceCollection devices;
-            // stateMask 0xB = ACTIVE|DISABLED|UNPLUGGED (skip NOT_PRESENT)
             enumerator.EnumAudioEndpoints(1, 0xB, out devices);
             int count;
             devices.GetCount(out count);
             var volumeGuid = new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
-            float[] volumes = new float[count];
+            volumes = new float[count];
+            muted = new bool[count];
             for (int i = 0; i < count; i++) {
                 try {
                     IMMDevice device;
                     devices.Item(i, out device);
                     object activated;
                     device.Activate(volumeGuid, 1, IntPtr.Zero, out activated);
-                    if (activated == null) { volumes[i] = 1.0f; continue; }
+                    if (activated == null) { volumes[i] = 1.0f; muted[i] = false; continue; }
                     var vol = (IAudioEndpointVolume)activated;
                     float current;
                     vol.GetMasterVolumeLevelScalar(out current);
                     volumes[i] = current;
-                } catch { volumes[i] = 1.0f; }
+                    bool isMuted;
+                    vol.GetMute(out isMuted);
+                    muted[i] = isMuted;
+                } catch { volumes[i] = 1.0f; muted[i] = false; }
             }
-            return volumes;
-        } catch { return new float[0]; }
+        } catch {}
     }
 
     public static void SetCaptureVolume(int index, float level) {
@@ -79,7 +84,6 @@ public static class AudioHelper {
             var enumeratorType = Type.GetTypeFromCLSID(new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E"));
             var enumerator = (IMMDeviceEnumerator)Activator.CreateInstance(enumeratorType);
             IMMDeviceCollection devices;
-            // stateMask 0xB = ACTIVE|DISABLED|UNPLUGGED (skip NOT_PRESENT)
             enumerator.EnumAudioEndpoints(1, 0xB, out devices);
             IMMDevice device;
             devices.Item(index, out device);
@@ -90,6 +94,24 @@ public static class AudioHelper {
             if (activated == null) return;
             var vol = (IAudioEndpointVolume)activated;
             vol.SetMasterVolumeLevelScalar(level, ref ctx);
+        } catch {}
+    }
+
+    public static void SetCaptureUnmute(int index) {
+        try {
+            var enumeratorType = Type.GetTypeFromCLSID(new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E"));
+            var enumerator = (IMMDeviceEnumerator)Activator.CreateInstance(enumeratorType);
+            IMMDeviceCollection devices;
+            enumerator.EnumAudioEndpoints(1, 0xB, out devices);
+            IMMDevice device;
+            devices.Item(index, out device);
+            var volumeGuid = new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
+            var ctx = Guid.Empty;
+            object activated;
+            device.Activate(volumeGuid, 1, IntPtr.Zero, out activated);
+            if (activated == null) return;
+            var vol = (IAudioEndpointVolume)activated;
+            vol.SetMute(false, ref ctx);
         } catch {}
     }
 }
@@ -108,10 +130,12 @@ Get-WmiObject Win32_Process -Filter "Name='powershell.exe' AND CommandLine LIKE 
         Add-Content -Path $logFile -Value "$ts  Killed stale guard instance (PID $($_.ProcessId))"
     }
 
-# Track per-device mute timestamps: key = device index, value = DateTime when 0% was first seen
+# Track per-device mute timestamps: key = device index, value = DateTime when mute was first seen
+# Covers both hardware mute (mute flag) and volume-at-0% mute
 $muteTimers = @{}
-# Track per-device previous volume for change detection
+# Track per-device previous state for change detection
 $prevVolumes = @{}
+$prevMuted = @{}
 
 $consecutiveErrors = 0
 $lastPollTime = Get-Date
@@ -125,14 +149,17 @@ while ($true) {
         $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         Add-Content -Path $logFile -Value "$ts  Wake detected (${gap}s gap) - resetting device state"
         $prevVolumes = @{}
+        $prevMuted = @{}
         $muteTimers = @{}
     }
     $lastPollTime = $now
 
     try {
-        $volumes = [AudioHelper]::GetCaptureVolumes()
+        $volumes = $null
+        $muted = $null
+        [AudioHelper]::GetCaptureState([ref]$volumes, [ref]$muted)
 
-        if ($volumes.Length -eq 0) {
+        if ($null -eq $volumes -or $volumes.Length -eq 0) {
             # COM may be stale after sleep/wake - wait and retry
             $consecutiveErrors++
             if ($consecutiveErrors -eq 1 -or $consecutiveErrors % 30 -eq 0) {
@@ -147,67 +174,86 @@ while ($true) {
             $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             Add-Content -Path $logFile -Value "$ts  Recovered after $consecutiveErrors failed attempts"
             $consecutiveErrors = 0
-            # Reset state after recovery - device indices may have changed
             $prevVolumes = @{}
+            $prevMuted = @{}
             $muteTimers = @{}
         }
 
         for ($i = 0; $i -lt $volumes.Length; $i++) {
             $vol = $volumes[$i]
             $pct = [int]($vol * 100)
+            $isMuted = $muted[$i]
             $prevPct = if ($prevVolumes.ContainsKey($i)) { $prevVolumes[$i] } else { -1 }
+            $wasMuted = if ($prevMuted.ContainsKey($i)) { $prevMuted[$i] } else { $false }
 
-            # Log any volume change
+            # Log volume changes
             if ($pct -ne $prevPct) {
                 $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                 if ($prevPct -eq -1) {
-                    Add-Content -Path $logFile -Value "$ts  Device $i initial volume: ${pct}%"
+                    Add-Content -Path $logFile -Value "$ts  Device $i initial volume: ${pct}% muted: $isMuted"
                 } else {
-                    Add-Content -Path $logFile -Value "$ts  Device $i volume changed: ${prevPct}% -> ${pct}%"
+                    Add-Content -Path $logFile -Value "$ts  Device $i volume changed: ${prevPct}% -> ${pct}% muted: $isMuted"
                 }
                 $prevVolumes[$i] = $pct
             }
 
-            if ($vol -ge 0.99) {
-                # Volume is fine, clear any mute timer
-                if ($muteTimers.ContainsKey($i)) {
-                    $muteTimers.Remove($i)
+            # Log mute state changes
+            if ($isMuted -ne $wasMuted -and $prevPct -ne -1) {
+                $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                if ($isMuted) {
+                    Add-Content -Path $logFile -Value "$ts  Device $i mute flag set (hardware mute)"
+                } else {
+                    Add-Content -Path $logFile -Value "$ts  Device $i mute flag cleared (hardware unmute)"
                 }
-                continue
             }
+            $prevMuted[$i] = $isMuted
 
-            if ($vol -le 0.01) {
-                # Volume is at 0% - intentional mute (headset button)
+            # Check if device is muted (either via mute flag or volume at 0%)
+            $effectivelyMuted = $isMuted -or ($vol -le 0.01)
+
+            if ($effectivelyMuted) {
+                # Device is muted; respect with grace period
                 if (-not $muteTimers.ContainsKey($i)) {
-                    # First time seeing 0%, start grace period
                     $muteTimers[$i] = Get-Date
                     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                    Add-Content -Path $logFile -Value "$ts  Device $i muted (0%), grace period started (${muteGraceSec}s)"
+                    $reason = if ($isMuted) { "mute flag" } else { "0% volume" }
+                    Add-Content -Path $logFile -Value "$ts  Device $i muted ($reason), grace period started (${muteGraceSec}s)"
                     continue
                 }
 
                 $elapsed = ((Get-Date) - $muteTimers[$i]).TotalSeconds
                 if ($elapsed -lt $muteGraceSec) {
-                    # Still within grace period, leave it muted
                     continue
                 }
 
-                # Grace period expired, restore to 100%
+                # Grace period expired, restore
+                if ($isMuted) {
+                    [AudioHelper]::SetCaptureUnmute($i)
+                }
                 [AudioHelper]::SetCaptureVolume($i, 1.0)
                 $muteTimers.Remove($i)
                 $prevVolumes[$i] = 100
+                $prevMuted[$i] = $false
                 $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                 Add-Content -Path $logFile -Value "$ts  Device $i mute grace expired (${muteGraceSec}s), restored to 100%"
-            } else {
-                # Volume drifted to something other than 0% or 100% - fix immediately
-                [AudioHelper]::SetCaptureVolume($i, 1.0)
-                if ($muteTimers.ContainsKey($i)) {
-                    $muteTimers.Remove($i)
-                }
-                $prevVolumes[$i] = 100
-                $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                Add-Content -Path $logFile -Value "$ts  Device $i was at ${pct}%, restored to 100%"
+                continue
             }
+
+            # Not muted; clear any mute timer
+            if ($muteTimers.ContainsKey($i)) {
+                $muteTimers.Remove($i)
+            }
+
+            if ($vol -ge 0.99) {
+                # Volume is fine
+                continue
+            }
+
+            # Volume drifted to something other than 100% - fix immediately
+            [AudioHelper]::SetCaptureVolume($i, 1.0)
+            $prevVolumes[$i] = 100
+            $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Add-Content -Path $logFile -Value "$ts  Device $i was at ${pct}%, restored to 100%"
         }
     } catch {
         $consecutiveErrors++
