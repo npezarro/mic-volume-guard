@@ -117,8 +117,11 @@ public static class AudioHelper {
 }
 "@
 
-$logFile = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "mic-volume-guard.log"
+$scriptPath = $MyInvocation.MyCommand.Path
+$scriptDir = Split-Path -Parent $scriptPath
+$logFile = Join-Path $scriptDir "mic-volume-guard.log"
 $muteGraceSec = 120
+$maxStaleSeconds = 300  # restart self if no successful poll for 5 minutes
 
 # Kill any other mic-volume-guard instances (prevent stacking)
 $myPid = $PID
@@ -139,6 +142,7 @@ $prevMuted = @{}
 
 $consecutiveErrors = 0
 $lastPollTime = Get-Date
+$heartbeatFile = Join-Path $scriptDir "mic-volume-guard.heartbeat"
 
 while ($true) {
     # Detect sleep/wake: if more than 30 seconds passed since last poll,
@@ -261,6 +265,19 @@ while ($true) {
             $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             Add-Content -Path $logFile -Value "$ts  ERROR (attempt $consecutiveErrors): $($_.Exception.Message)"
         }
+    }
+
+    # Write heartbeat so external watchdog can detect frozen process
+    [IO.File]::WriteAllText($heartbeatFile, (Get-Date).ToString("o"))
+
+    # Self-restart if stale for too long (COM objects gone bad after sleep/wake)
+    $staleSec = $consecutiveErrors * 2  # each error = ~2 seconds
+    if ($staleSec -ge $maxStaleSeconds) {
+        $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Add-Content -Path $logFile -Value "$ts  Stale for ${staleSec}s ($consecutiveErrors errors), restarting self..."
+        Start-Process powershell -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`"" -WindowStyle Hidden
+        Start-Sleep -Seconds 2
+        exit 0
     }
 
     Start-Sleep -Seconds 2

@@ -42,29 +42,33 @@ $shortcutPath = "$startupDir\MicVolumeGuard.lnk"
 $shell    = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath       = "powershell.exe"
-$shortcut.Arguments        = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$guardScript`""
+$watchdogScript = Join-Path $scriptDir "mic-volume-guard-watchdog.ps1"
+$shortcut.Arguments        = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdogScript`""
 $shortcut.WorkingDirectory = $scriptDir
 $shortcut.Description      = "Mic Volume Guard - keeps recording input at 100%"
 $shortcut.Save()
 Write-Host "  Shortcut: $shortcutPath" -ForegroundColor Green
 
-# ── Kill ALL existing guard processes (WMI for reliable CommandLine access) ─
-Write-Host "Killing any existing guard instances..." -ForegroundColor Cyan
+# ── Kill ALL existing guard/watchdog processes ─
+Write-Host "Killing any existing guard/watchdog instances..." -ForegroundColor Cyan
 $killed = 0
-Get-WmiObject Win32_Process -Filter "Name='powershell.exe' AND CommandLine LIKE '%mic-volume-guard%'" -ErrorAction SilentlyContinue |
+$myPid = $PID
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*mic-volume-guard*' -and $_.ProcessId -ne $myPid -and $_.CommandLine -notlike '*setup*' } |
     ForEach-Object {
-        $_.Terminate() | Out-Null
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         Write-Host "  Killed PID $($_.ProcessId)" -ForegroundColor Yellow
         $killed++
     }
 if ($killed -eq 0) {
     Write-Host "  No existing instances found." -ForegroundColor Green
 }
+Start-Sleep -Seconds 2
 
-Write-Host "Starting mic-volume-guard..." -ForegroundColor Cyan
+Write-Host "Starting mic-volume-guard watchdog..." -ForegroundColor Cyan
 
-Start-Process powershell -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$guardScript`"" -WindowStyle Hidden
-Write-Host "  Guard is running in background." -ForegroundColor Green
+Start-Process powershell -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdogScript`"" -WindowStyle Hidden
+Write-Host "  Watchdog + guard running in background." -ForegroundColor Green
 
 # ── Summary ──────────────────────────────────────────────────────────
 Write-Host ""
