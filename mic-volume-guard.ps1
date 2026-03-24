@@ -122,6 +122,7 @@ $scriptDir = Split-Path -Parent $scriptPath
 $logFile = Join-Path $scriptDir "mic-volume-guard.log"
 $muteGraceSec = 120
 $maxStaleSeconds = 300  # restart self if no successful poll for 5 minutes
+$minVolumeThreshold = 0.50  # only correct volume below this (avoids interfering with hardware mute)
 
 # Kill any other mic-volume-guard instances (prevent stacking)
 $myPid = $PID
@@ -248,12 +249,13 @@ while ($true) {
                 $muteTimers.Remove($i)
             }
 
-            if ($vol -ge 0.99) {
-                # Volume is fine
+            if ($vol -ge $minVolumeThreshold) {
+                # Volume is above threshold, leave it alone
+                # This avoids constant writes that interfere with hardware mute
                 continue
             }
 
-            # Volume drifted to something other than 100% - fix immediately
+            # Volume dropped below threshold - fix immediately
             [AudioHelper]::SetCaptureVolume($i, 1.0)
             $prevVolumes[$i] = 100
             $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
